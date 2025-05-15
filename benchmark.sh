@@ -1,5 +1,7 @@
 #! /bin/sh
 
+set -e
+PATH=.:$PATH
 tree=${1:-/usr/bin}
 dbname=${2:-pgfiler_bench}
 
@@ -7,7 +9,7 @@ if createdb $dbname; then
 	psql -d $dbname <<:EOF:
 		CREATE TABLE file_table (
 			filename text primary key,
-			contents binary not null
+			contents bytea not null
 		);
 :EOF:
 else
@@ -15,9 +17,12 @@ else
 	exit
 fi
 
-find $tree -type f -print | while read filename; do
-	pgfiler -d $dbname insert file_table filename "$filename" contents $filename
+find $tree -type f -perm -4 -print | while read filename; do
+	pgfiler -d $dbname -b upsert file_table \
+		filename "$filename" \
+		contents "$filename"
 	echo -n .
 done
+echo ""
 
 exit

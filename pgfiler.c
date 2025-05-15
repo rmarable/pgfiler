@@ -112,7 +112,8 @@ main(int argc, char *argv[]) {
 			binary = true;
 			break;
 		case 'd':
-			dbname = optarg;
+			free(dbname);
+			dbname = strdup(optarg);
 			break;
 		case 'h':
 			pghost = optarg;
@@ -178,7 +179,7 @@ main(int argc, char *argv[]) {
 	conn = PQsetdbLogin(pghost, pgport, pgoptions, pgtty,
 			    dbname, pguser, pgpasswd);
 	if (PQstatus(conn) == CONNECTION_BAD) {
-		fprintf(stderr, "%s: \"%s\": %s", progname, dbname,
+		fprintf(stderr, "%s: %s: %s\n", progname, dbname,
 			PQerrorMessage(conn));
 		status = 1;
 	} else {
@@ -217,7 +218,10 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 
 	/* Open the output file if there is one. */
 	if (file != NULL)
-		CHECK((fd = open(file, O_WRONLY|O_CREAT)) < 0)
+		if ((fd = open(file, O_WRONLY|O_CREAT)) < 0) {
+			perror(file);
+			goto done;
+		}
 
 	/* Build the query. */
 	CHECK((asprintf(&cmd, "SELECT %s FROM %s WHERE %s = $1",
@@ -232,7 +236,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	res = PQexecParams(conn, cmd, 1, paramTypes,
 			   paramValues, NULL, NULL, binary);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-		fprintf(stderr, "%s: \"%s\": %s", progname, cmd,
+		fprintf(stderr, "%s: \"%s\": %s\n", progname, cmd,
 			PQresultErrorMessage(res));
 		goto done;
 	}
@@ -281,7 +285,10 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 
 	/* Open the file if there is one. */
 	if (file != NULL)
-		CHECK((fd = open(file, O_RDONLY)) < 0)
+		if ((fd = open(file, O_RDONLY)) < 0) {
+			perror(file);
+			goto done;
+		}
 
 	/*
 	 * If it's not a regular file, make a copy for mmap, then switch.
@@ -346,12 +353,13 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
-			if (tsf != NULL)
+			if (tsf != NULL) {
 				CHECK((asprintf(&tmp, "%s, %s = %s",
 						cmd, tsf, ts)) < 0)
-			free(cmd);
-			cmd = tmp;
-			tmp = NULL;
+				free(cmd);
+				cmd = tmp;
+				tmp = NULL;
+			}
 		}
 		break;
 	case Replace: /*FALLTHROUGH*/
@@ -365,7 +373,8 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 			tmp = NULL;
 		}
 		if (op == Replace) {
-			CHECK((asprintf(&tmp, "%s %s = $2", cmd, vf)) < 0)
+			CHECK((asprintf(&tmp, "%s %s = $2",
+					cmd, vf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
@@ -395,12 +404,12 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 			   paramValues, paramLengths, paramFormats,
 			   0);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-		fprintf(stderr, "%s: \"%s\": %s (%d) \"%s\" - %s",
+		fprintf(stderr, "%s: \"%s\": %s (%d) \"%s\" - %s\n",
 			progname, cmd,
 			PQresStatus(PQresultStatus(res)),
 			PQresultStatus(res), PQcmdStatus(res),
 			PQresultErrorMessage(res) != NULL ?
-				PQresultErrorMessage(res) : "\n");
+				PQresultErrorMessage(res) : "");
 		goto done;
 	}
 	if (strcmp(PQcmdTuples(res), "0") == 0) {
