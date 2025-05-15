@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2025 by Paul Vixie
- * Portions Copyright (c) 2000-2001,2008 by Internet Software Consortium, Inc.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -43,7 +42,7 @@
 
 typedef enum { Select, Upsert, Insert, Replace, Append } Op;
 
-static const char *progname = "pgfile";
+static const char *progname = "pgfiler";
 
 static int	get(PGconn *, const char *, const char *, const char *,
 		    const char *, const char *);
@@ -221,7 +220,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		CHECK((fd = open(file, O_WRONLY|O_CREAT)) < 0)
 
 	/* Build the query. */
-	CHECK((asprintf(&cmd, "SELECT %s FROM %s WHERE %s = $1::TEXT",
+	CHECK((asprintf(&cmd, "SELECT %s FROM %s WHERE %s = $1",
 			tf, table, kf)) < 0)
 
 	/* Send the query. */
@@ -293,7 +292,7 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		size_t s;
 		int tf;
 
-		CHECK((asprintf(&tmp, "%s/pgfile.XXXXXX", tmpdir)) < 0)
+		CHECK((asprintf(&tmp, "%s/pgfiler.XXXXXX", tmpdir)) < 0)
 		CHECK((tf = mkstemp(tmp)) < 0)
 		CHECK((unlink(tmp)) < 0)
 		ts = strdup("'now'::TIMESTAMP");
@@ -333,22 +332,17 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	case Insert:
 		if (tsf != NULL) {
 			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s, %s)"
-						" VALUES"
-						"($1::TEXT, $2::%s, %s)",
-					table, kf, vf, tsf,
-					binary ? "BYTEA" : "TEXT",
-					ts)) < 0)
+						" VALUES ($1, $2, %s)",
+					table, kf, vf, tsf, ts)) < 0)
 		} else {
 			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s)"
-						" VALUES ($1::TEXT, $2::%s)",
-					table, kf, vf,
-					binary ? "BYTEA" : "TEXT")) < 0)
+						" VALUES ($1, $2)",
+					table, kf, vf)) < 0)
 		}
 		if (op == Upsert) {
 			CHECK((asprintf(&tmp, "%s ON CONFLICT (%s) DO UPDATE"
-						" SET %s = $2::%s",
-					cmd, kf,
-					vf, binary ? "BYTEA" : "TEXT")) < 0)
+						" SET %s = $2",
+					cmd, kf, vf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
@@ -364,29 +358,25 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	case Append:
 		CHECK((asprintf(&cmd, "UPDATE %s SET", table)) < 0)
 		if (tsf != NULL) {
-			CHECK((asprintf(&tmp, "%s %s = %s,", cmd, tsf, ts))
-			      < 0)
+			CHECK((asprintf(&tmp, "%s %s = %s,",
+					cmd, tsf, ts)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		}
 		if (op == Replace) {
-			CHECK((asprintf(&tmp, "%s %s = $2::%s",
-					cmd, vf, binary ? "BYTEA" : "TEXT"))
-			      < 0)
+			CHECK((asprintf(&tmp, "%s %s = $2", cmd, vf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		} else {
-			CHECK((asprintf(&tmp, "%s %s = %s || $2::%s",
-					cmd, vf, vf,
-					binary ? "BYTEA" : "TEXT"))
-			      < 0)
+			CHECK((asprintf(&tmp, "%s %s = %s || $2",
+					cmd, vf, vf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		}
-		CHECK((asprintf(&tmp, "%s WHERE %s = $1::TEXT", cmd, kf)) < 0)
+		CHECK((asprintf(&tmp, "%s WHERE %s = $1", cmd, kf)) < 0)
 		free(cmd);
 		cmd = tmp;
 		tmp = NULL;

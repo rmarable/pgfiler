@@ -18,7 +18,7 @@ CBUILD= -W -Wall -Wcast-qual -Wpointer-arith -Wwrite-strings \
 	-Wmissing-prototypes  -Wbad-function-cast -Wnested-externs \
 	-Wunused -Wshadow -Wmissing-noreturn -Wswitch-enum \
 	-Wformat-nonliteral -Werror
-ALL= pgcat pgfile
+ALL= pgfiler
 
 CDEBUG= -g
 LDFLAGS= -L/usr/lib/postgresql
@@ -29,10 +29,7 @@ all: $(ALL)
 
 clean:; rm -f $(ALL); rm -f *.o
 
-pgcat: pgcat.o Makefile
-	$(CC) $(LDFLAGS) -o pgcat pgcat.o $(LIBS)
-pgfile: pgfile.o Makefile
-	$(CC) $(LDFLAGS) -o pgfile pgfile.o $(LIBS)
+pgfiler: pgfiler.o Makefile
+	$(CC) $(LDFLAGS) -o pgfiler pgfiler.o $(LIBS)
 
-pgcat.o: pgcat.c Makefile
-pgfile.o: pgfile.c Makefile
+pgfiler.o: pgfiler.c Makefile
