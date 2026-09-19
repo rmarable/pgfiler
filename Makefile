@@ -21,8 +21,9 @@ CBUILD= -W -Wall -Wcast-qual -Wpointer-arith -Wwrite-strings \
 ALL= pgfiler
 
 CDEBUG= -g
-LDFLAGS= -L/usr/lib/postgresql
-CFLAGS= -I/usr/include/pgsql $(CDEBUG) $(CBUILD)
+PG_CONFIG= pg_config
+LDFLAGS= -L`$(PG_CONFIG) --libdir`
+CFLAGS= -I`$(PG_CONFIG) --includedir` $(CDEBUG) $(CBUILD)
 LIBS= -lpq
 
 all: $(ALL)
