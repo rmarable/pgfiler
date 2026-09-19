@@ -17,7 +17,7 @@ else
 	exit
 fi
 
-find $tree -type f -perm -4 -print | while read filename; do
+find $tree -type f -perm -4 -print | while read -r filename; do
 	pgfiler -d $dbname -b upsert file_table \
 		filename "$filename" \
 		contents "$filename"
