@@ -5,8 +5,8 @@ PATH=.:$PATH
 tree=${1:-/usr/bin}
 dbname=${2:-pgfiler_bench}
 
-if createdb $dbname; then
-	psql -d $dbname <<:EOF:
+if createdb "$dbname"; then
+	psql -d "$dbname" <<:EOF:
 		CREATE TABLE file_table (
 			filename text primary key,
 			contents bytea not null
@@ -14,14 +14,14 @@ if createdb $dbname; then
 :EOF:
 else
 	echo recommend you "'dropdb $dbname'"
-	exit
+	exit 1
 fi
 
-find $tree -type f -perm -4 -print | while read -r filename; do
-	pgfiler -d $dbname -b upsert file_table \
+find "$tree" -type f -perm -4 -print | while read -r filename; do
+	pgfiler -d "$dbname" -b upsert file_table \
 		filename "$filename" \
 		contents "$filename"
-	echo -n .
+	printf .
 done
 echo ""
 
