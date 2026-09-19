@@ -45,8 +45,13 @@
 #define	PG_FMT_TEXT 0
 #define	PG_FMT_BINARY 1
 
-/* The server will not store a field larger than this (MaxAllocSize - 1). */
-#define	PG_MAX_VALUE 0x3fffffff
+/*
+ * The server refuses a protocol message larger than MaxAllocSize - 1, and
+ * the Bind message carrying our value also carries the key and a few
+ * dozen bytes of framing.
+ */
+#define	PG_MAX_MESSAGE 0x3ffffffe
+#define	PG_BIND_OVERHEAD 64
 
 #define	CHECK(expr) { if (expr) { perror(#expr); goto done; } }
 
@@ -85,6 +90,8 @@ usage(const char *msg) {
 		"\t<file> defaults to stdin (put) or stdout (select);\n"
 		"\t-b means <vf> is bytea rather than text;\n"
 		"\t-M names a column to set to the file's mtime;\n"
+		"\t-P is visible in ps(1); PGPASSWORD or ~/.pgpass is not;\n"
+		"\ta <k> beginning with '-' needs a '--' before <op>;\n"
 		"example:\n"
 		"\t%s select file_table filename 1.2.3.4 file_data\n",
 		progname, progname);
@@ -94,9 +101,9 @@ usage(const char *msg) {
 int
 main(int argc, char *argv[]) {
 	const char	*pghost = NULL, *pgport = NULL, *pgoptions = NULL,
-			*pgtty = NULL, *pguser = NULL, *pgpasswd = NULL;
+			*pgtty = NULL, *pguser = NULL;
 	const char	*opstr, *table, *kf, *k, *vf, *file, *tsf, *t;
-	char		*dbname;
+	char		*dbname, *pgpasswd = NULL;
 	int		status = 0, ch;
 	PGconn		*conn;
 	Op		op;
@@ -145,7 +152,10 @@ main(int argc, char *argv[]) {
 			pgoptions = optarg;
 			break;
 		case 'P':
-			pgpasswd = optarg;
+			/* Keep a copy, then hide the original from ps(1). */
+			free(pgpasswd);
+			pgpasswd = xstrdup(optarg);
+			explicit_bzero(optarg, strlen(optarg));
 			break;
 		case 'p':
 			pgport = optarg;
@@ -225,6 +235,11 @@ main(int argc, char *argv[]) {
 	PQfinish(conn);
 	free(dbname);
 	dbname = NULL;
+	if (pgpasswd != NULL) {
+		explicit_bzero(pgpasswd, strlen(pgpasswd));
+		free(pgpasswd);
+		pgpasswd = NULL;
+	}
 	return (status);
 }
 
@@ -240,7 +255,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	const Oid	paramTypes[] = { PG_OID_INFER };
 	const char	*paramValues[] = { v };
 	int		fd = STDOUT_FILENO;
-	char		*cmd = NULL;
+	char		*cmd = NULL, *tmp = NULL;
 	PGresult	*res = NULL;
 	char		*qtable = NULL, *qkf = NULL, *qtf = NULL;
 	int		status = 1;
@@ -295,12 +310,14 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	}
 
 	/*
-	 * Open the output file only now, so that a failed query leaves
-	 * whatever was there before it alone.
+	 * Write to a temporary file beside the real one, and rename it into
+	 * place only once it's complete, so that neither a failed query nor
+	 * a failed write leaves a partial or empty file where a good one was.
 	 */
 	if (file != NULL) {
-		if ((fd = open(file, O_WRONLY|O_CREAT|O_TRUNC, 0666)) < 0) {
-			perror(file);
+		tmp = xasprintf("%s.XXXXXX", file);
+		if ((fd = mkstemp(tmp)) < 0) {
+			perror(tmp);
 			goto done;
 		}
 		opened = true;
@@ -316,6 +333,32 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	CHECK(!writeall(fd, ptr, (size_t) len))
 	if (!binary && len > 0 && ptr[len-1] != '\n' && isatty(fd))
 		CHECK(!writeall(fd, "\n", 1))
+
+	if (file != NULL) {
+		struct stat sb;
+		mode_t mode;
+
+		/* Keep the old file's mode, or give a new one the usual. */
+		if (stat(file, &sb) == 0) {
+			mode = sb.st_mode & 07777;
+		} else {
+			mode = umask(0);
+			umask(mode);
+			mode = 0666 & ~mode;
+		}
+		if (fchmod(fd, mode) < 0) {
+			perror(file);
+			goto done;
+		}
+		/* Some filesystems only report a failed write at close. */
+		opened = false;
+		if (close(fd) < 0 || rename(tmp, file) < 0) {
+			perror(file);
+			goto done;
+		}
+		free(tmp);
+		tmp = NULL;
+	}
 	status = 0;
  done:
 	if (qtable != NULL)
@@ -326,10 +369,11 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		free(qtf);
 	if (cmd != NULL)
 		free(cmd);
-	/* Some filesystems only report a failed write here. */
-	if (opened && close(fd) < 0) {
-		perror(file);
-		status = 1;
+	if (opened)
+		close(fd);
+	if (tmp != NULL) {
+		unlink(tmp);
+		free(tmp);
 	}
 	if (res != NULL)
 		PQclear(res);
@@ -349,6 +393,8 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	bool		fdmine = false;
 	struct stat	sb;
 	size_t		len = 0;
+	off_t		maxval = PG_MAX_MESSAGE - PG_BIND_OVERHEAD
+				 - (off_t) strlen(k);
 	Oid		paramTypes[10], *pt = paramTypes;
 	const		char *paramValues[10], **pv = paramValues;
 	int		paramLengths[10], *pl = paramLengths;
@@ -383,9 +429,10 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	if (S_ISREG(sb.st_mode) && sb.st_size > 0) {
 		void *p;
 
-		if (sb.st_size > PG_MAX_VALUE) {
-			fprintf(stderr, "%s: %jd bytes is larger than %d\n",
-				progname, (intmax_t) sb.st_size, PG_MAX_VALUE);
+		if (sb.st_size > maxval) {
+			fprintf(stderr, "%s: %jd bytes is larger than %jd\n",
+				progname, (intmax_t) sb.st_size,
+				(intmax_t) maxval);
 			goto done;
 		}
 		len = (size_t) sb.st_size;
@@ -413,9 +460,10 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		tmp = NULL;
 		while ((s = read(fd, buf, sizeof buf)) > 0) {
 			/* Stop before filling tmpdir with unusable data. */
-			if ((total += s) > PG_MAX_VALUE) {
+			if ((total += s) > maxval) {
 				fprintf(stderr, "%s: input is larger than"
-					" %d bytes\n", progname, PG_MAX_VALUE);
+					" %jd bytes\n", progname,
+					(intmax_t) maxval);
 				goto done;
 			}
 			CHECK(!writeall(tf, buf, (size_t) s))
