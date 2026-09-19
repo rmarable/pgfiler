@@ -59,6 +59,7 @@ typedef enum { Select, Upsert, Insert, Replace, Append } Op;
 
 static const char *progname = "pgfiler";
 
+static void	usage(const char *msg) __attribute__((noreturn));
 static int	get(PGconn *, const char *, const char *, const char *,
 		    const char *, const char *);
 static int	put(PGconn *, const char *, const char *, const char *,
@@ -66,15 +67,13 @@ static int	put(PGconn *, const char *, const char *, const char *,
 static char	*quote(PGconn *, const char *);
 static bool	writeall(int, const void *, size_t);
 static char	*xasprintf(const char *, ...)
-		    __attribute__((format(printf, 1, 2)));
+			   __attribute__((format(printf, 1, 2)));
 static char	*xstrdup(const char *);
+static void	*xmemset(void *, int, size_t);
 
 static const	char *tmpdir;
 static int	tracelevel;
 static bool	binary;
-
-static void
-usage(const char *msg) __attribute__((noreturn));
 
 static void
 usage(const char *msg) {
@@ -155,7 +154,7 @@ main(int argc, char *argv[]) {
 			/* Keep a copy, then hide the original from ps(1). */
 			free(pgpasswd);
 			pgpasswd = xstrdup(optarg);
-			explicit_bzero(optarg, strlen(optarg));
+			xmemset(optarg, 0, strlen(optarg));
 			break;
 		case 'p':
 			pgport = optarg;
@@ -236,11 +235,11 @@ main(int argc, char *argv[]) {
 	free(dbname);
 	dbname = NULL;
 	if (pgpasswd != NULL) {
-		explicit_bzero(pgpasswd, strlen(pgpasswd));
+		xmemset(pgpasswd, 0, strlen(pgpasswd));
 		free(pgpasswd);
 		pgpasswd = NULL;
 	}
-	return (status);
+	return status;
 }
 
 static int
@@ -356,28 +355,43 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 			perror(file);
 			goto done;
 		}
+		fd = -1;
 		free(tmp);
 		tmp = NULL;
 	}
 	status = 0;
  done:
-	if (qtable != NULL)
+	if (qtable != NULL) {
 		free(qtable);
-	if (qkf != NULL)
+		qtable = NULL;
+	}
+	if (qkf != NULL) {
 		free(qkf);
-	if (qtf != NULL)
+		qkf = NULL;
+	}
+	if (qtf != NULL) {
 		free(qtf);
-	if (cmd != NULL)
+		qtf = NULL;
+	}
+	if (cmd != NULL) {
 		free(cmd);
-	if (opened)
+		cmd = NULL;
+	}
+	if (opened) {
 		close(fd);
+		fd = -1;
+		opened = false;
+	}
 	if (tmp != NULL) {
 		unlink(tmp);
 		free(tmp);
+		tmp = NULL;
 	}
-	if (res != NULL)
+	if (res != NULL) {
 		PQclear(res);
-	return (status);
+		res = NULL;
+	}
+	return status;
 }
 
 static int
@@ -590,29 +604,51 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	status = 0;
 
  done:
-	if (ts != NULL)
+	if (ts != NULL) {
 		free(ts);
-	if (tmp != NULL)
+		ts = NULL;
+	}
+	if (tmp != NULL) {
 		free(tmp);
-	if (qtable != NULL)
+		tmp = NULL;
+	}
+	if (qtable != NULL) {
 		free(qtable);
-	if (qkf != NULL)
+		qtable = NULL;
+	}
+	if (qkf != NULL) {
 		free(qkf);
-	if (qvf != NULL)
+		qkf = NULL;
+	}
+	if (qvf != NULL) {
 		free(qvf);
-	if (qtsf != NULL)
+		qvf = NULL;
+	}
+	if (qtsf != NULL) {
 		free(qtsf);
-	if (map != NULL)
+		qtsf = NULL;
+	}
+	if (map != NULL) {
 		munmap(map, len);
-	if (tf >= 0)
+		map = NULL;
+	}
+	if (tf >= 0) {
 		close(tf);
-	if (fdmine && fd >= 0)
+		tf = -1;
+	}
+	if (fdmine && fd >= 0) {
 		close(fd);
-	if (cmd != NULL)
+		fd = -1;
+	}
+	if (cmd != NULL) {
 		free(cmd);
-	if (res != NULL)
+		cmd = NULL;
+	}
+	if (res != NULL) {
 		PQclear(res);
-	return (status);
+		res = NULL;
+	}
+	return status;
 }
 
 /*
@@ -635,19 +671,20 @@ quote(PGconn *conn, const char *name) {
 			fprintf(stderr, "%s: %s: empty identifier\n",
 				progname, name);
 			free(res);
-			return (NULL);
+			return NULL;
 		}
 		if ((q = PQescapeIdentifier(conn, part, plen)) == NULL) {
 			fprintf(stderr, "%s: %s: %s", progname, name,
 				PQerrorMessage(conn));
 			free(res);
-			return (NULL);
+			return NULL;
 		}
 		if (res == NULL) {
 			tmp = xstrdup(q);
 		} else {
 			tmp = xasprintf("%s.%s", res, q);
 			free(res);
+			res = NULL;
 		}
 		res = tmp;
 		PQfreemem(q);
@@ -656,7 +693,7 @@ quote(PGconn *conn, const char *name) {
 		else
 			part = dot + 1;
 	}
-	return (res);
+	return res;
 }
 
 /*
@@ -674,16 +711,16 @@ writeall(int fd, const void *buf, size_t len) {
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
-			return (false);
+			return false;
 		}
 		if (n == 0) {
 			errno = EIO;
-			return (false);
+			return false;
 		}
 		ptr += n;
 		len -= (size_t) n;
 	}
-	return (true);
+	return true;
 }
 
 static char *
@@ -699,7 +736,7 @@ xasprintf(const char *fmt, ...) {
 		perror("asprintf");
 		exit(1);
 	}
-	return (res);
+	return res;
 }
 
 static char *
@@ -710,5 +747,15 @@ xstrdup(const char *str) {
 		perror("strdup");
 		exit(1);
 	}
-	return (res);
+	return res;
+}
+
+static void *
+xmemset(void *p, int c, size_t n) {
+	volatile char *q = p;
+	size_t i = 0;
+
+	while (i++ < n)
+		*q++ = (char)c;
+	return p;
 }
