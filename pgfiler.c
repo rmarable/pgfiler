@@ -15,7 +15,7 @@
  * SOFTWARE.
  */
 
-#define	_GNU_SOURCE	/* for asprintf() */
+#define	_GNU_SOURCE	/* for vasprintf() */
 
 #include <sys/mman.h>
 #include <sys/param.h>
@@ -23,10 +23,13 @@
 #include <sys/types.h>
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <paths.h>
 #include <pwd.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +44,9 @@
 #define	PG_FMT_TEXT 0
 #define	PG_FMT_BINARY 1
 
+/* The server will not store a field larger than this (MaxAllocSize - 1). */
+#define	PG_MAX_VALUE 0x3fffffff
+
 #define	CHECK(expr) { if (expr) { perror(#expr); goto done; } }
 
 typedef enum { Select, Upsert, Insert, Replace, Append } Op;
@@ -52,6 +58,9 @@ static int	get(PGconn *, const char *, const char *, const char *,
 static int	put(PGconn *, const char *, const char *, const char *,
 		    const char *, const char *, const char *, Op);
 static char	*quote(PGconn *, const char *);
+static bool	writeall(int, const void *, size_t);
+static char	*xasprintf(const char *, ...)
+		    __attribute__((format(printf, 1, 2)));
 static char	*xstrdup(const char *);
 
 static const	char *tmpdir;
@@ -98,8 +107,9 @@ main(int argc, char *argv[]) {
 			progname = argv[0];
 	}
 
-	if ((t = getenv("USER")) == NULL &&
-	    (t = getenv("LOGNAME")) == NULL) {
+	if ((t = getenv("USER")) == NULL || *t == '\0')
+		t = getenv("LOGNAME");
+	if (t == NULL || *t == '\0') {
 		struct passwd *pw = getpwuid(getuid());
 
 		if (pw == NULL) {
@@ -187,6 +197,9 @@ main(int argc, char *argv[]) {
 		      "'replace', or 'append'");
 	}
 
+	if (op == Select && tsf != NULL)
+		usage("-M is meaningless with 'select'");
+
 	conn = PQsetdbLogin(pghost, pgport, pgoptions, pgtty,
 			    dbname, pguser, pgpasswd);
 	if (PQstatus(conn) == CONNECTION_BAD) {
@@ -225,23 +238,16 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	PGresult	*res = NULL;
 	char		*qtable = NULL, *qkf = NULL, *qtf = NULL;
 	int		status = 1;
+	bool		opened = false;
 	char		*ptr;
 	int		len;
-
-	/* Open the output file if there is one. */
-	if (file != NULL)
-		if ((fd = open(file, O_WRONLY|O_CREAT|O_TRUNC, 0666)) < 0) {
-			perror(file);
-			goto done;
-		}
 
 	/* Build the query. */
 	if ((qtable = quote(conn, table)) == NULL ||
 	    (qkf = quote(conn, kf)) == NULL ||
 	    (qtf = quote(conn, tf)) == NULL)
 		goto done;
-	CHECK((asprintf(&cmd, "SELECT %s FROM %s WHERE %s = $1",
-			qtf, qtable, qkf)) < 0)
+	cmd = xasprintf("SELECT %s FROM %s WHERE %s = $1", qtf, qtable, qkf);
 
 	/* Send the query. */
 	if (tracelevel > 0) {
@@ -267,17 +273,39 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		goto done;
 	}
 
+	/*
+	 * Without -b, a bytea column arrives in its text representation
+	 * ("\x48690a"), which is not the file the caller asked for.
+	 */
+	if (!binary && PQftype(res, 0) == PG_OID_BYTEA) {
+		fprintf(stderr, "%s: \"%s\": column is bytea, needs -b\n",
+			progname, cmd);
+		goto done;
+	}
+
 	if (PQgetisnull(res, 0, 0)) {
 		fprintf(stderr, "%s: \"%s\": null value?\n", progname, cmd);
 		goto done;
 	}
 
+	/*
+	 * Open the output file only now, so that a failed query leaves
+	 * whatever was there before it alone.
+	 */
+	if (file != NULL) {
+		if ((fd = open(file, O_WRONLY|O_CREAT|O_TRUNC, 0666)) < 0) {
+			perror(file);
+			goto done;
+		}
+		opened = true;
+	}
+
 	/* Output the result. */
 	ptr = PQgetvalue(res, 0, 0);
 	len = PQgetlength(res, 0, 0);
-	CHECK((write(fd, ptr, (size_t) len)) != len)
+	CHECK(!writeall(fd, ptr, (size_t) len))
 	if (!binary && len > 0 && ptr[len-1] != '\n')
-		CHECK((write(fd, "\n", 1)) != 1)
+		CHECK(!writeall(fd, "\n", 1))
 	status = 0;
  done:
 	if (qtable != NULL)
@@ -288,7 +316,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		free(qtf);
 	if (cmd != NULL)
 		free(cmd);
-	if (file != NULL && fd >= 0)
+	if (opened)
 		close(fd);
 	if (res != NULL)
 		PQclear(res);
@@ -303,10 +331,10 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	char		*qtable = NULL, *qkf = NULL, *qvf = NULL, *qtsf = NULL;
 	const char	*val = "";
 	PGresult	*res = NULL;
-	int		fd = STDIN_FILENO;
+	int		fd = STDIN_FILENO, tf = -1;
 	int		status = 1;
 	struct stat	sb;
-	size_t		len;
+	size_t		len = 0;
 	Oid		paramTypes[10], *pt = paramTypes;
 	const		char *paramValues[10], **pv = paramValues;
 	int		paramLengths[10], *pl = paramLengths;
@@ -325,35 +353,43 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	CHECK((fstat(fd, &sb)) < 0)
 	if ((sb.st_mode & S_IFMT) != S_IFREG) {
 		char buf[65536];
+		off_t total = 0;
 		ssize_t s;
-		int tf;
 
-		CHECK((asprintf(&tmp, "%s%spgfiler.XXXXXX", tmpdir,
-				tmpdir[strlen(tmpdir)-1] == '/' ? "" : "/"))
-		      < 0)
+		tmp = xasprintf("%s%spgfiler.XXXXXX", tmpdir,
+				tmpdir[strlen(tmpdir)-1] == '/' ? "" : "/");
 		CHECK((tf = mkstemp(tmp)) < 0)
 		CHECK((unlink(tmp)) < 0)
 		free(tmp);
 		tmp = NULL;
 		ts = xstrdup("'now'::TIMESTAMP");
-		while ((s = read(fd, buf, sizeof buf)) > 0)
-			CHECK((write(tf, buf, (size_t) s)) != s)
+		while ((s = read(fd, buf, sizeof buf)) > 0) {
+			/* Stop before filling tmpdir with unusable data. */
+			if ((total += s) > PG_MAX_VALUE) {
+				fprintf(stderr, "%s: input is larger than"
+					" %d bytes\n", progname, PG_MAX_VALUE);
+				goto done;
+			}
+			CHECK(!writeall(tf, buf, (size_t) s))
+		}
 		CHECK(s < 0)
 		close(fd);
 		fd = tf;
+		tf = -1;
 		CHECK((fstat(fd, &sb)) < 0)
 	} else {
 		if (tsf != NULL)
-			CHECK((asprintf(&ts, "to_timestamp(%lu)",
-					(u_long) sb.st_mtime)) < 0)
+			ts = xasprintf("to_timestamp(%jd)",
+				       (intmax_t) sb.st_mtime);
 	}
 
 	/* Map it into virtual memory, unless it's empty. */
-	len = sb.st_size;
-	if (len > INT_MAX) {
-		fprintf(stderr, "%s: %zu bytes is too large\n", progname, len);
+	if (sb.st_size > PG_MAX_VALUE) {
+		fprintf(stderr, "%s: %jd bytes is larger than %d\n", progname,
+			(intmax_t) sb.st_size, PG_MAX_VALUE);
 		goto done;
 	}
+	len = (size_t) sb.st_size;
 	if (len != 0) {
 		void *p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
 
@@ -388,24 +424,24 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	case Upsert: /*FALLTHROUGH*/
 	case Insert:
 		if (tsf != NULL) {
-			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s, %s)"
-						" VALUES ($1, $2, %s)",
-					qtable, qkf, qvf, qtsf, ts)) < 0)
+			cmd = xasprintf("INSERT INTO %s (%s, %s, %s)"
+					" VALUES ($1, $2, %s)",
+					qtable, qkf, qvf, qtsf, ts);
 		} else {
-			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s)"
-						" VALUES ($1, $2)",
-					qtable, qkf, qvf)) < 0)
+			cmd = xasprintf("INSERT INTO %s (%s, %s)"
+					" VALUES ($1, $2)",
+					qtable, qkf, qvf);
 		}
 		if (op == Upsert) {
-			CHECK((asprintf(&tmp, "%s ON CONFLICT (%s) DO UPDATE"
-						" SET %s = $2",
-					cmd, qkf, qvf)) < 0)
+			tmp = xasprintf("%s ON CONFLICT (%s) DO UPDATE"
+					" SET %s = $2",
+					cmd, qkf, qvf);
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 			if (tsf != NULL) {
-				CHECK((asprintf(&tmp, "%s, %s = %s",
-						cmd, qtsf, ts)) < 0)
+				tmp = xasprintf("%s, %s = %s",
+						cmd, qtsf, ts);
 				free(cmd);
 				cmd = tmp;
 				tmp = NULL;
@@ -414,28 +450,24 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		break;
 	case Replace: /*FALLTHROUGH*/
 	case Append:
-		CHECK((asprintf(&cmd, "UPDATE %s SET", qtable)) < 0)
+		cmd = xasprintf("UPDATE %s SET", qtable);
 		if (tsf != NULL) {
-			CHECK((asprintf(&tmp, "%s %s = %s,",
-					cmd, qtsf, ts)) < 0)
+			tmp = xasprintf("%s %s = %s,", cmd, qtsf, ts);
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		}
 		if (op == Replace) {
-			CHECK((asprintf(&tmp, "%s %s = $2",
-					cmd, qvf)) < 0)
-			free(cmd);
-			cmd = tmp;
-			tmp = NULL;
+			tmp = xasprintf("%s %s = $2", cmd, qvf);
 		} else {
-			CHECK((asprintf(&tmp, "%s %s = %s || $2",
-					cmd, qvf, qvf)) < 0)
-			free(cmd);
-			cmd = tmp;
-			tmp = NULL;
+			/* COALESCE, since NULL || anything is NULL. */
+			tmp = xasprintf("%s %s = COALESCE(%s, '') || $2",
+					cmd, qvf, qvf);
 		}
-		CHECK((asprintf(&tmp, "%s WHERE %s = $1", cmd, qkf)) < 0)
+		free(cmd);
+		cmd = tmp;
+		tmp = NULL;
+		tmp = xasprintf("%s WHERE %s = $1", cmd, qkf);
 		free(cmd);
 		cmd = tmp;
 		tmp = NULL;
@@ -473,6 +505,8 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
  done:
 	if (ts != NULL)
 		free(ts);
+	if (tmp != NULL)
+		free(tmp);
 	if (qtable != NULL)
 		free(qtable);
 	if (qkf != NULL)
@@ -483,6 +517,8 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		free(qtsf);
 	if (map != NULL)
 		munmap(map, len);
+	if (tf >= 0)
+		close(tf);
 	if (fd != STDIN_FILENO && fd >= 0)
 		close(fd);
 	if (cmd != NULL)
@@ -504,11 +540,17 @@ quote(PGconn *conn, const char *name) {
 
 	while (more) {
 		const char *dot = strchr(part, '.');
-		char *q = PQescapeIdentifier(conn, part,
-					     dot != NULL ? (size_t) (dot - part)
-							 : strlen(part));
+		size_t plen = (dot != NULL) ? (size_t) (dot - part)
+					    : strlen(part);
+		char *q;
 
-		if (q == NULL) {
+		if (plen == 0) {
+			fprintf(stderr, "%s: %s: empty identifier\n",
+				progname, name);
+			free(res);
+			return (NULL);
+		}
+		if ((q = PQescapeIdentifier(conn, part, plen)) == NULL) {
 			fprintf(stderr, "%s: %s: %s", progname, name,
 				PQerrorMessage(conn));
 			free(res);
@@ -517,10 +559,7 @@ quote(PGconn *conn, const char *name) {
 		if (res == NULL) {
 			tmp = xstrdup(q);
 		} else {
-			if (asprintf(&tmp, "%s.%s", res, q) < 0) {
-				perror("asprintf");
-				exit(1);
-			}
+			tmp = xasprintf("%s.%s", res, q);
 			free(res);
 		}
 		res = tmp;
@@ -529,6 +568,49 @@ quote(PGconn *conn, const char *name) {
 			more = false;
 		else
 			part = dot + 1;
+	}
+	return (res);
+}
+
+/*
+ * write(2) is allowed to do less than it's told, and says nothing about
+ * errno when it does, so a partial write must be retried rather than
+ * reported with perror().
+ */
+static bool
+writeall(int fd, const void *buf, size_t len) {
+	const char *ptr = buf;
+
+	while (len != 0) {
+		ssize_t n = write(fd, ptr, len);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return (false);
+		}
+		if (n == 0) {
+			errno = EIO;
+			return (false);
+		}
+		ptr += n;
+		len -= (size_t) n;
+	}
+	return (true);
+}
+
+static char *
+xasprintf(const char *fmt, ...) {
+	char *res;
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vasprintf(&res, fmt, ap);
+	va_end(ap);
+	if (n < 0) {
+		perror("asprintf");
+		exit(1);
 	}
 	return (res);
 }
