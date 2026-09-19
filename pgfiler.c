@@ -15,6 +15,8 @@
  * SOFTWARE.
  */
 
+#define	_GNU_SOURCE	/* for asprintf() */
+
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -22,6 +24,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <paths.h>
 #include <pwd.h>
 #include <stdbool.h>
@@ -218,7 +221,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 
 	/* Open the output file if there is one. */
 	if (file != NULL)
-		if ((fd = open(file, O_WRONLY|O_CREAT)) < 0) {
+		if ((fd = open(file, O_WRONLY|O_CREAT|O_TRUNC, 0666)) < 0) {
 			perror(file);
 			goto done;
 		}
@@ -254,9 +257,9 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	/* Output the result. */
 	ptr = PQgetvalue(res, 0, 0);
 	len = PQgetlength(res, 0, 0);
-	write(fd, ptr, len);
+	CHECK((write(fd, ptr, (size_t) len)) != len)
 	if (!binary && len > 0 && ptr[len-1] != '\n')
-		write(fd, "\n", 1);
+		CHECK((write(fd, "\n", 1)) != 1)
 	status = 0;
  done:
 	if (cmd != NULL)
@@ -272,7 +275,8 @@ static int
 put(PGconn *conn, const char *table, const char *kf, const char *k,
     const char *vf, const char *file, const char *tsf, Op op)
 {
-	char		*cmd = NULL, *tmp, *ts = NULL, *ptr = NULL;
+	char		*cmd = NULL, *tmp = NULL, *ts = NULL, *map = NULL;
+	const char	*val = "";
 	PGresult	*res = NULL;
 	int		fd = STDIN_FILENO;
 	int		status = 1;
@@ -296,15 +300,18 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	CHECK((fstat(fd, &sb)) < 0)
 	if ((sb.st_mode & S_IFMT) != S_IFREG) {
 		char buf[65536];
-		size_t s;
+		ssize_t s;
 		int tf;
 
 		CHECK((asprintf(&tmp, "%s/pgfiler.XXXXXX", tmpdir)) < 0)
 		CHECK((tf = mkstemp(tmp)) < 0)
 		CHECK((unlink(tmp)) < 0)
+		free(tmp);
+		tmp = NULL;
 		ts = strdup("'now'::TIMESTAMP");
 		while ((s = read(fd, buf, sizeof buf)) > 0)
-			write(tf, buf, s);
+			CHECK((write(tf, buf, (size_t) s)) != s)
+		CHECK(s < 0)
 		close(fd);
 		fd = tf;
 		CHECK((fstat(fd, &sb)) < 0)
@@ -314,10 +321,19 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 					(u_long) sb.st_mtime)) < 0)
 	}
 
-	/* Map it into virtual memory. */
+	/* Map it into virtual memory, unless it's empty. */
 	len = sb.st_size;
-	CHECK((ptr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0))
-	      == MAP_FAILED)
+	if (len > INT_MAX) {
+		fprintf(stderr, "%s: %zu bytes is too large\n", progname, len);
+		goto done;
+	}
+	if (len != 0) {
+		void *p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+
+		CHECK(p == MAP_FAILED)
+		map = p;
+		val = p;
+	}
 
 	// $1 is the key
 	*pt++ = PG_OID_TEXT;
@@ -325,11 +341,12 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	*pl++ = strlen(k);
 	*pf++ = PG_FMT_TEXT;
 
-	// $2 is the value
+	// $2 is the value; binary format, since libpq derives the length of
+	// a text format parameter with strlen(), and this one isn't a string.
 	*pt++ = binary ? PG_OID_BYTEA : PG_OID_TEXT;
-	*pv++ = ptr;
+	*pv++ = val;
 	*pl++ = len;
-	*pf++ = binary ? PG_FMT_BINARY : PG_FMT_TEXT;
+	*pf++ = PG_FMT_BINARY;
 
 	/* Construct the INSERT or UPDATE command. */
 	switch (op) {
@@ -423,8 +440,8 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
  done:
 	if (ts != NULL)
 		free(ts);
-	if (ptr != NULL)
-		munmap(ptr, len);
+	if (map != NULL)
+		munmap(map, len);
 	if (fd != STDIN_FILENO)
 		close(fd);
 	if (cmd != NULL)
