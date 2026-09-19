@@ -38,6 +38,7 @@
 
 #include <libpq-fe.h>
 
+#define	PG_OID_INFER 0	/* let the server deduce it from context */
 #define	PG_OID_BYTEA 17
 #define	PG_OID_TEXT 25
 
@@ -231,7 +232,12 @@ static int
 get(PGconn *conn, const char *table, const char *kf, const char *v,
     const char *tf, const char *file)
 {
-	const Oid	paramTypes[] = { PG_OID_TEXT };
+	/*
+	 * $1 is the key, whose type is whatever the key column is -- saying
+	 * "text" here would mean no integer or inet key column could ever
+	 * be matched.
+	 */
+	const Oid	paramTypes[] = { PG_OID_INFER };
 	const char	*paramValues[] = { v };
 	int		fd = STDOUT_FILENO;
 	char		*cmd = NULL;
@@ -300,11 +306,15 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		opened = true;
 	}
 
-	/* Output the result. */
+	/*
+	 * Output the result.  The courtesy newline is only for a human
+	 * looking at a terminal; adding it to a file would mean a store,
+	 * fetch and store again did not round trip.
+	 */
 	ptr = PQgetvalue(res, 0, 0);
 	len = PQgetlength(res, 0, 0);
 	CHECK(!writeall(fd, ptr, (size_t) len))
-	if (!binary && len > 0 && ptr[len-1] != '\n')
+	if (!binary && len > 0 && ptr[len-1] != '\n' && isatty(fd))
 		CHECK(!writeall(fd, "\n", 1))
 	status = 0;
  done:
@@ -333,6 +343,7 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	PGresult	*res = NULL;
 	int		fd = STDIN_FILENO, tf = -1;
 	int		status = 1;
+	bool		fdmine = false;
 	struct stat	sb;
 	size_t		len = 0;
 	Oid		paramTypes[10], *pt = paramTypes;
@@ -341,11 +352,13 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	int		paramFormats[10], *pf = paramFormats;
 
 	/* Open the file if there is one. */
-	if (file != NULL)
+	if (file != NULL) {
 		if ((fd = open(file, O_RDONLY)) < 0) {
 			perror(file);
 			goto done;
 		}
+		fdmine = true;
+	}
 
 	/*
 	 * If it's not a regular file, make a copy for mmap, then switch.
@@ -376,6 +389,7 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		close(fd);
 		fd = tf;
 		tf = -1;
+		fdmine = true;
 		CHECK((fstat(fd, &sb)) < 0)
 	} else {
 		if (tsf != NULL)
@@ -398,8 +412,9 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		val = p;
 	}
 
-	// $1 is the key
-	*pt++ = PG_OID_TEXT;
+	// $1 is the key; its type is the key column's, which only the
+	// server knows, so that an integer or inet key column still works.
+	*pt++ = PG_OID_INFER;
 	*pv++ = k;
 	*pl++ = strlen(k);
 	*pf++ = PG_FMT_TEXT;
@@ -519,7 +534,7 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		munmap(map, len);
 	if (tf >= 0)
 		close(tf);
-	if (fd != STDIN_FILENO && fd >= 0)
+	if (fdmine && fd >= 0)
 		close(fd);
 	if (cmd != NULL)
 		free(cmd);
