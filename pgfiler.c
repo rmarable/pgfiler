@@ -51,6 +51,8 @@ static int	get(PGconn *, const char *, const char *, const char *,
 		    const char *, const char *);
 static int	put(PGconn *, const char *, const char *, const char *,
 		    const char *, const char *, const char *, Op);
+static char	*quote(PGconn *, const char *);
+static char	*xstrdup(const char *);
 
 static const	char *tmpdir;
 static int	tracelevel;
@@ -59,18 +61,20 @@ static bool	binary;
 static void
 usage(const char *msg) __attribute__((noreturn));
 
-void
+static void
 usage(const char *msg) {
 	fprintf(stderr, "%s: usage error (%s)\n", progname, msg);
 	fprintf(stderr,
 		"usage:\n"
-		"\t%s [-bdhMiPpTtux <v>] [-b]"
-		" <op> <tbl> <kf> <k> <vf> [<file>]\n"
+		"\t%s [-b] [-M tsf] [-T tmpdir] [-x tracelevel]\n"
+		"\t\t[-d dbname] [-h dbhost] [-p dbport] [-o pgoptions]\n"
+		"\t\t[-u pguser] [-t pgtty] [-P pgpasswd]\n"
+		"\t\t<op> <tbl> <kf> <k> <vf> [<file>]\n"
 		"where:\n"
 		"\t<op> is select|upsert|insert|replace|append;\n"
-		"\t-d dbname; -h dbhost; -p dbport;\n"
-		"\t-o pgoptions; -u pguser; -t pgtty; -P pgpasswd;\n"
-		"\t-x tracelevel; -T tmpdir;\n"
+		"\t<file> defaults to stdin (put) or stdout (select);\n"
+		"\t-b means <vf> is bytea rather than text;\n"
+		"\t-M names a column to set to the file's mtime;\n"
 		"example:\n"
 		"\t%s select file_table filename 1.2.3.4 file_data\n",
 		progname, progname);
@@ -87,10 +91,12 @@ main(int argc, char *argv[]) {
 	PGconn		*conn;
 	Op		op;
 
-	if ((progname = strrchr(argv[0], '/')) != NULL)
-		progname++;
-	else if (argv[0] != NULL)
-		progname = argv[0];
+	if (argv[0] != NULL) {
+		if ((progname = strrchr(argv[0], '/')) != NULL)
+			progname++;
+		else
+			progname = argv[0];
+	}
 
 	if ((t = getenv("USER")) == NULL &&
 	    (t = getenv("LOGNAME")) == NULL) {
@@ -102,9 +108,9 @@ main(int argc, char *argv[]) {
 		}
 		t = pw->pw_name;
 	}
-	dbname = strdup(t);
+	dbname = xstrdup(t);
 
-	if ((tmpdir = getenv("TMPDIR")) == NULL)
+	if ((tmpdir = getenv("TMPDIR")) == NULL || *tmpdir == '\0')
 		tmpdir = _PATH_TMP;
 
 	tsf = NULL;
@@ -116,7 +122,7 @@ main(int argc, char *argv[]) {
 			break;
 		case 'd':
 			free(dbname);
-			dbname = strdup(optarg);
+			dbname = xstrdup(optarg);
 			break;
 		case 'h':
 			pghost = optarg;
@@ -134,6 +140,8 @@ main(int argc, char *argv[]) {
 			pgport = optarg;
 			break;
 		case 'T':
+			if (*optarg == '\0')
+				usage("tmpdir must not be empty");
 			tmpdir = optarg;
 			break;
 		case 't':
@@ -215,6 +223,7 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 	int		fd = STDOUT_FILENO;
 	char		*cmd = NULL;
 	PGresult	*res = NULL;
+	char		*qtable = NULL, *qkf = NULL, *qtf = NULL;
 	int		status = 1;
 	char		*ptr;
 	int		len;
@@ -227,8 +236,12 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		}
 
 	/* Build the query. */
+	if ((qtable = quote(conn, table)) == NULL ||
+	    (qkf = quote(conn, kf)) == NULL ||
+	    (qtf = quote(conn, tf)) == NULL)
+		goto done;
 	CHECK((asprintf(&cmd, "SELECT %s FROM %s WHERE %s = $1",
-			tf, table, kf)) < 0)
+			qtf, qtable, qkf)) < 0)
 
 	/* Send the query. */
 	if (tracelevel > 0) {
@@ -254,6 +267,11 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		goto done;
 	}
 
+	if (PQgetisnull(res, 0, 0)) {
+		fprintf(stderr, "%s: \"%s\": null value?\n", progname, cmd);
+		goto done;
+	}
+
 	/* Output the result. */
 	ptr = PQgetvalue(res, 0, 0);
 	len = PQgetlength(res, 0, 0);
@@ -262,9 +280,15 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		CHECK((write(fd, "\n", 1)) != 1)
 	status = 0;
  done:
+	if (qtable != NULL)
+		free(qtable);
+	if (qkf != NULL)
+		free(qkf);
+	if (qtf != NULL)
+		free(qtf);
 	if (cmd != NULL)
 		free(cmd);
-	if (file != NULL)
+	if (file != NULL && fd >= 0)
 		close(fd);
 	if (res != NULL)
 		PQclear(res);
@@ -276,6 +300,7 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
     const char *vf, const char *file, const char *tsf, Op op)
 {
 	char		*cmd = NULL, *tmp = NULL, *ts = NULL, *map = NULL;
+	char		*qtable = NULL, *qkf = NULL, *qvf = NULL, *qtsf = NULL;
 	const char	*val = "";
 	PGresult	*res = NULL;
 	int		fd = STDIN_FILENO;
@@ -303,12 +328,14 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		ssize_t s;
 		int tf;
 
-		CHECK((asprintf(&tmp, "%s/pgfiler.XXXXXX", tmpdir)) < 0)
+		CHECK((asprintf(&tmp, "%s%spgfiler.XXXXXX", tmpdir,
+				tmpdir[strlen(tmpdir)-1] == '/' ? "" : "/"))
+		      < 0)
 		CHECK((tf = mkstemp(tmp)) < 0)
 		CHECK((unlink(tmp)) < 0)
 		free(tmp);
 		tmp = NULL;
-		ts = strdup("'now'::TIMESTAMP");
+		ts = xstrdup("'now'::TIMESTAMP");
 		while ((s = read(fd, buf, sizeof buf)) > 0)
 			CHECK((write(tf, buf, (size_t) s)) != s)
 		CHECK(s < 0)
@@ -348,6 +375,12 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	*pl++ = len;
 	*pf++ = PG_FMT_BINARY;
 
+	if ((qtable = quote(conn, table)) == NULL ||
+	    (qkf = quote(conn, kf)) == NULL ||
+	    (qvf = quote(conn, vf)) == NULL ||
+	    (tsf != NULL && (qtsf = quote(conn, tsf)) == NULL))
+		goto done;
+
 	/* Construct the INSERT or UPDATE command. */
 	switch (op) {
 	case Select:
@@ -357,22 +390,22 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		if (tsf != NULL) {
 			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s, %s)"
 						" VALUES ($1, $2, %s)",
-					table, kf, vf, tsf, ts)) < 0)
+					qtable, qkf, qvf, qtsf, ts)) < 0)
 		} else {
 			CHECK((asprintf(&cmd, "INSERT INTO %s (%s, %s)"
 						" VALUES ($1, $2)",
-					table, kf, vf)) < 0)
+					qtable, qkf, qvf)) < 0)
 		}
 		if (op == Upsert) {
 			CHECK((asprintf(&tmp, "%s ON CONFLICT (%s) DO UPDATE"
 						" SET %s = $2",
-					cmd, kf, vf)) < 0)
+					cmd, qkf, qvf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 			if (tsf != NULL) {
 				CHECK((asprintf(&tmp, "%s, %s = %s",
-						cmd, tsf, ts)) < 0)
+						cmd, qtsf, ts)) < 0)
 				free(cmd);
 				cmd = tmp;
 				tmp = NULL;
@@ -381,28 +414,28 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		break;
 	case Replace: /*FALLTHROUGH*/
 	case Append:
-		CHECK((asprintf(&cmd, "UPDATE %s SET", table)) < 0)
+		CHECK((asprintf(&cmd, "UPDATE %s SET", qtable)) < 0)
 		if (tsf != NULL) {
 			CHECK((asprintf(&tmp, "%s %s = %s,",
-					cmd, tsf, ts)) < 0)
+					cmd, qtsf, ts)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		}
 		if (op == Replace) {
 			CHECK((asprintf(&tmp, "%s %s = $2",
-					cmd, vf)) < 0)
+					cmd, qvf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		} else {
 			CHECK((asprintf(&tmp, "%s %s = %s || $2",
-					cmd, vf, vf)) < 0)
+					cmd, qvf, qvf)) < 0)
 			free(cmd);
 			cmd = tmp;
 			tmp = NULL;
 		}
-		CHECK((asprintf(&tmp, "%s WHERE %s = $1", cmd, kf)) < 0)
+		CHECK((asprintf(&tmp, "%s WHERE %s = $1", cmd, qkf)) < 0)
 		free(cmd);
 		cmd = tmp;
 		tmp = NULL;
@@ -440,13 +473,73 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
  done:
 	if (ts != NULL)
 		free(ts);
+	if (qtable != NULL)
+		free(qtable);
+	if (qkf != NULL)
+		free(qkf);
+	if (qvf != NULL)
+		free(qvf);
+	if (qtsf != NULL)
+		free(qtsf);
 	if (map != NULL)
 		munmap(map, len);
-	if (fd != STDIN_FILENO)
+	if (fd != STDIN_FILENO && fd >= 0)
 		close(fd);
 	if (cmd != NULL)
 		free(cmd);
 	if (res != NULL)
 		PQclear(res);
 	return (status);
+}
+
+/*
+ * Quote a possibly qualified SQL identifier, one dotted part at a time,
+ * so that "schema.table" still means what it says.
+ */
+static char *
+quote(PGconn *conn, const char *name) {
+	const char	*part = name;
+	char		*res = NULL, *tmp;
+	bool		more = true;
+
+	while (more) {
+		const char *dot = strchr(part, '.');
+		char *q = PQescapeIdentifier(conn, part,
+					     dot != NULL ? (size_t) (dot - part)
+							 : strlen(part));
+
+		if (q == NULL) {
+			fprintf(stderr, "%s: %s: %s", progname, name,
+				PQerrorMessage(conn));
+			free(res);
+			return (NULL);
+		}
+		if (res == NULL) {
+			tmp = xstrdup(q);
+		} else {
+			if (asprintf(&tmp, "%s.%s", res, q) < 0) {
+				perror("asprintf");
+				exit(1);
+			}
+			free(res);
+		}
+		res = tmp;
+		PQfreemem(q);
+		if (dot == NULL)
+			more = false;
+		else
+			part = dot + 1;
+	}
+	return (res);
+}
+
+static char *
+xstrdup(const char *str) {
+	char *res = strdup(str);
+
+	if (res == NULL) {
+		perror("strdup");
+		exit(1);
+	}
+	return (res);
 }
