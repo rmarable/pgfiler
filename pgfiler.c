@@ -326,8 +326,11 @@ get(PGconn *conn, const char *table, const char *kf, const char *v,
 		free(qtf);
 	if (cmd != NULL)
 		free(cmd);
-	if (opened)
-		close(fd);
+	/* Some filesystems only report a failed write here. */
+	if (opened && close(fd) < 0) {
+		perror(file);
+		status = 1;
+	}
 	if (res != NULL)
 		PQclear(res);
 	return (status);
@@ -361,10 +364,43 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 	}
 
 	/*
-	 * If it's not a regular file, make a copy for mmap, then switch.
+	 * The mtime is only meaningful for a regular file; anything else,
+	 * a pipe say, is being written right now.
 	 */
 	CHECK((fstat(fd, &sb)) < 0)
-	if ((sb.st_mode & S_IFMT) != S_IFREG) {
+	if (tsf != NULL) {
+		if (S_ISREG(sb.st_mode))
+			ts = xasprintf("to_timestamp(%jd)",
+				       (intmax_t) sb.st_mtime);
+		else
+			ts = xstrdup("'now'::TIMESTAMP");
+	}
+
+	/*
+	 * First choice is to map the file directly, which wants a regular
+	 * file of known size.
+	 */
+	if (S_ISREG(sb.st_mode) && sb.st_size > 0) {
+		void *p;
+
+		if (sb.st_size > PG_MAX_VALUE) {
+			fprintf(stderr, "%s: %jd bytes is larger than %d\n",
+				progname, (intmax_t) sb.st_size, PG_MAX_VALUE);
+			goto done;
+		}
+		len = (size_t) sb.st_size;
+		p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+		if (p != MAP_FAILED)
+			map = p;
+	}
+
+	/*
+	 * Otherwise copy it to a temporary file and map that.  This is for
+	 * pipes, but also for /proc, where stat reports st_size 0 -- or a
+	 * wrong nonzero count, as for /proc/mounts -- for files full of
+	 * content, and where mmap refuses the file anyway.
+	 */
+	if (map == NULL) {
 		char buf[65536];
 		off_t total = 0;
 		ssize_t s;
@@ -375,7 +411,6 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		CHECK((unlink(tmp)) < 0)
 		free(tmp);
 		tmp = NULL;
-		ts = xstrdup("'now'::TIMESTAMP");
 		while ((s = read(fd, buf, sizeof buf)) > 0) {
 			/* Stop before filling tmpdir with unusable data. */
 			if ((total += s) > PG_MAX_VALUE) {
@@ -390,27 +425,16 @@ put(PGconn *conn, const char *table, const char *kf, const char *k,
 		fd = tf;
 		tf = -1;
 		fdmine = true;
-		CHECK((fstat(fd, &sb)) < 0)
-	} else {
-		if (tsf != NULL)
-			ts = xasprintf("to_timestamp(%jd)",
-				       (intmax_t) sb.st_mtime);
-	}
+		len = (size_t) total;
+		if (len != 0) {
+			void *p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
 
-	/* Map it into virtual memory, unless it's empty. */
-	if (sb.st_size > PG_MAX_VALUE) {
-		fprintf(stderr, "%s: %jd bytes is larger than %d\n", progname,
-			(intmax_t) sb.st_size, PG_MAX_VALUE);
-		goto done;
+			CHECK(p == MAP_FAILED)
+			map = p;
+		}
 	}
-	len = (size_t) sb.st_size;
-	if (len != 0) {
-		void *p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
-
-		CHECK(p == MAP_FAILED)
-		map = p;
-		val = p;
-	}
+	if (map != NULL)
+		val = map;
 
 	// $1 is the key; its type is the key column's, which only the
 	// server knows, so that an integer or inet key column still works.
