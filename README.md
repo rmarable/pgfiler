@@ -4,9 +4,7 @@
 
 ## Build
 
-`make`
-
-The build needs the `libpq` headers and library, and the `pg_config` that reports their locations. Neither is part of a default system, so install one of these first:
+To build `pgfiler`, we need the `libpq` headers and library, and the `pg_config` that reports their locations. Neither is part of a default system, so install one of these first:
 
 | System | Package | Command |
 |--------|---------|---------|
@@ -14,11 +12,13 @@ The build needs the `libpq` headers and library, and the `pg_config` that report
 | Debian, Ubuntu | `libpq-dev` | `apt install libpq-dev` |
 | RHEL, Rocky | `libpq-devel` | `dnf install libpq-devel` |
 
-The two Linux packages put `pg_config` in `/usr/bin`, where the Makefile finds it. Homebrew's `libpq` is keg-only and stays off `PATH`, so name it explicitly:
+Then run `make`.
+
+On Linux, the packages above put `pg_config` in `/usr/bin`, where the Makefile finds it. Homebrew's `libpq` is keg-only and stays off `PATH`, so name it explicitly:
 
     make PG_CONFIG=$(brew --prefix libpq)/bin/pg_config
 
-A full PostgreSQL installation also supplies `pg_config` and will do instead. It is not otherwise needed to build, since `pgfiler` is a client and the server can be anywhere.
+A full PostgreSQL installation also supplies `pg_config` and will also work. However, it is not otherwise needed to build, since `pgfiler` is a client and the server can be anywhere.
 
 The Makefile sets `CC` to `clang` and takes the `libpq` include and library paths from `pg_config`. Use `make PG_CONFIG=/path/to/pg_config` whenever `pg_config` is not on `PATH`. `CBUILD` holds GCC-compatible warning flags, accepted by both `gcc` and `clang`, and `-Werror`; override `CBUILD` for a compiler that rejects them. `LDFLAGS` sets a library search path but no run-time path, so a `libpq` outside the system search path needs `LD_LIBRARY_PATH` or an equivalent at run time. There is no install target.
 
@@ -181,14 +181,14 @@ The value is always sent in binary format. `-b` selects the declared type of the
       -> standard output
       -> or mkstemp("file.XXXXXX") -> write -> fchmod -> close -> rename(file)
 
-When `<file>` is given, the temporary file is in the same directory as the target, so the rename does not cross a filesystem. A failed query, write, `fchmod`, `close`, or `rename` removes the temporary file and leaves an existing target unchanged. An existing target's mode is copied verbatim onto the new file, including any execute, setuid, setgid, or sticky bit, and the new file is owned by the invoking user. A target that does not exist yet gets `0666` minus the umask, so a retrieved executable is not executable until its mode is set. The result of `close` is checked because some filesystems report a write error only there. A newline is added only when the value is text, is not empty, does not already end in one, and the output is a terminal.
+When `<file>` is provided, the temporary file is in the same directory as the target, so the rename does not cross a file system. A failed query, write, `fchmod`, `close`, or `rename` removes the temporary file and leaves an existing target unchanged. An existing target's mode is copied verbatim onto the new file, including any execute, setuid, setgid, or sticky bit, and the new file is owned by the invoking user. A target that does not exist yet gets `0666` minus the umask, so a retrieved executable is not executable until its mode is set. The result of `close` is checked because some file systems report a write error only there. A newline is added only when the value is text, is not empty, does not already end in one, and the output is a terminal.
 
 Output to standard output has none of this protection. It is written directly, is not closed by `pgfiler`, and a failed write leaves partial data.
 
 ## Limits
 
 - `pgfiler` rejects input larger than 1073741758 bytes minus the length of the key, which follows from the server's maximum message size. PostgreSQL separately limits a `text` or `bytea` field to 1 GB, and repeated `append` reaches that limit first. Larger objects need a different tool.
-- Each operation holds at least one complete copy of the value in memory. If `tmpdir` is a memory filesystem, a spooled input costs that much again.
+- Each operation holds at least one complete copy of the value in memory. If `tmpdir` is a memory file system, a spooled input costs that much again.
 - Each invocation opens one connection and runs one statement. The connection cost is paid every time.
 - `put` maps the input file and does not take a snapshot. A file modified during the transfer can be stored inconsistently, and a file truncated during the transfer can terminate `pgfiler` with SIGBUS.
 - When the input is mapped, the whole file is used regardless of the descriptor's current offset. When it is spooled, copying starts at the current offset.
@@ -203,7 +203,7 @@ Output to standard output has none of this protection. It is written directly, i
 
 ## Benchmark
 
-`benchmark.sh [tree [dbname]]` creates a database, `pgfiler_bench` by default, holding the first two columns of the table shown under Examples. It then runs `pgfiler -b upsert` for every regular file under `tree`, `/usr/bin` by default, whose other-read permission bit is set, and prints one dot per stored file. If `createdb` fails, for example because the database exists, the script suggests `dropdb` and exits 1. It runs under `set -e`, so the first `pgfiler` failure stops it mid-line. It prepends the current directory to `PATH`, so `pgfiler` and every other command it runs, including `createdb`, `psql`, and `find`, are looked for there first. It reports no timings; use `time ./benchmark.sh` to measure.
+`benchmark.sh [tree [dbname]]` creates a database, `pgfiler_bench` by default, holding the first two columns of the table shown under Examples. It then runs `pgfiler -b upsert` for every regular file under `tree`, `/usr/bin` by default, whose other-read permission bit is set, and prints one dot per stored file. If `createdb` fails, for example because the database exists, the script suggests `dropdb` and exits with status 1. It runs under `set -e`, so the first `pgfiler` failure stops it mid-line. It prepends the current directory to `PATH`, so `pgfiler` and every other command it runs, including `createdb`, `psql`, and `find`, are looked for there first. It reports no timings; use `time ./benchmark.sh` to measure.
 
 ## Author and license
 
