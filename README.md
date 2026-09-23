@@ -87,7 +87,7 @@ A write that affects zero rows is reported as an error.
 
 `libpq` environment variables such as `PGHOST`, `PGPORT`, `PGUSER`, and `PGPASSWORD` supply any of the other connection parameters not given on the command line.
 
-Use `-b` when the value column is `bytea` and omit it when the column is `text`. `pgfiler` checks the combination in one direction only: `select` on a `bytea` column without `-b` is refused, because the value would arrive in its hex text form. The write direction is not checked, and PostgreSQL's assignment-cast rules mean a `bytea` parameter is accepted by a `text` column, storing the hex representation of the file rather than the file.
+Use `-b` when the value column is `bytea` and omit it when the column is `text`. Three of the four combinations are caught. A `select` from a `bytea` column without `-b` is refused by `pgfiler`, because the value would arrive in its hex text form. A write to a `bytea` column without `-b` is refused by the server, which reports a type mismatch. A `select` from a `text` column with `-b` returns the same bytes. The fourth combination fails silently: a write to a `text` column with `-b` succeeds and stores the hex representation of the file, twice its length plus two characters.
 
 The exit status is 0 on success and 1 on any reported failure.
 
